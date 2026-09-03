@@ -10,82 +10,51 @@ import cv2
 import numpy as np
 from PIL import Image
 import easyocr
-from playwright.sync_api import sync_playwright
 
-SESSION_FILE = ".keep_session.json"
-_ocr_reader = None
-
-
-def ensure_chromium():
-    subprocess.run(
-        ["playwright", "install", "chromium"],
-        capture_output=True,
-        timeout=120,
-    )
+ocr_reader = None
 
 
 def get_ocr_reader():
-    global _ocr_reader
-    if _ocr_reader is None:
-        _ocr_reader = easyocr.Reader(["ko", "en"], gpu=False, verbose=False)
-    return _ocr_reader
+    global ocr_reader
+    if ocr_reader is None:
+        ocr_reader = easyocr.Reader(["ko", "en"], gpu=False, verbose=False)
+    return ocr_reader
 
 
-def save_cookies(context):
-    cookies = context.cookies()
-    with open(SESSION_FILE, "w") as f:
-        json.dump(cookies, f)
+def ensure_chromium():
+    try:
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as p:
+            p.chromium.launch(headless=True)
+    except Exception:
+        subprocess.run(["playwright", "install", "chromium"], capture_output=True, timeout=120)
 
 
-def load_cookies():
-    if not os.path.exists(SESSION_FILE):
-        return None
-    with open(SESSION_FILE) as f:
-        return json.load(f)
+def extract_plate_number(image_bytes):
+    nparr = np.frombuffer(image_bytes, np.uint8)
+    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    pil_img = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+    reader = get_ocr_reader()
+    results = reader.readtext(np.array(pil_img))
+    all_digits = ""
+    for bbox, text, conf in results:
+        cleaned = re.sub(r"[^0-9]", "", text)
+        all_digits += cleaned
+    if len(all_digits) >= 4:
+        return all_digits[-4:]
+    return None
 
 
-# ── Playwright 구글 로그인 ─────────────────────────────────
-def login_with_playwright():
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=False)
-        context = browser.new_context()
-        page = context.new_page()
-        page.goto("https://keep.google.com")
-
-        try:
-            page.wait_for_url("https://keep.google.com/**", timeout=120000)
-            save_cookies(context)
-            browser.close()
-            return True
-        except Exception:
-            browser.close()
-            return False
-
-
-def is_logged_in():
-    return os.path.exists(SESSION_FILE)
-
-
-def clear_session():
-    if os.path.exists(SESSION_FILE):
-        os.remove(SESSION_FILE)
-
-
-# ── Playwright Keep 자동 체크 ──────────────────────────────
-def check_item_in_keep(note_url, plate_digits):
-    cookies = load_cookies()
-    if not cookies:
-        return False, "로그인이 필요합니다."
-
+def check_with_playwright(note_url, plate_digits, cookies_json):
+    from playwright.sync_api import sync_playwright
+    cookies = json.loads(cookies_json)
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         context = browser.new_context()
         context.add_cookies(cookies)
-
         page = context.new_page()
         page.goto(note_url, wait_until="networkidle", timeout=30000)
         time.sleep(3)
-
         result = page.evaluate("""(plateDigits) => {
             const checkboxes = document.querySelectorAll('[role="checkbox"]');
             for (const cb of checkboxes) {
@@ -105,10 +74,7 @@ def check_item_in_keep(note_url, plate_digits):
             }
             return { found: false };
         }""", plate_digits)
-
-        save_cookies(context)
         browser.close()
-
         if result.get("found"):
             if result.get("wasChecked"):
                 return True, "이미 체크되어 있었습니다."
@@ -116,139 +82,137 @@ def check_item_in_keep(note_url, plate_digits):
         return False, f"'{plate_digits}' 항목을 찾을 수 없습니다."
 
 
-# ── 세션 관리 ──────────────────────────────────────────────
+CONFIG_FILE = ".keep_config.json"
+
+
+def load_config():
+    if os.path.exists(CONFIG_FILE):
+        with open(CONFIG_FILE) as f:
+            return json.load(f)
+    return {}
+
+
+def save_config(data):
+    existing = load_config()
+    existing.update(data)
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(existing, f)
+
+
+def clear_config():
+    for f in [CONFIG_FILE]:
+        if os.path.exists(f):
+            os.remove(f)
+
+
 def init_session_state():
-    defaults = {"logged_in": False, "email": None, "note_url": None, "page": "login"}
+    defaults = {"page": "login", "logged_in": False}
     for k, v in defaults.items():
         if k not in st.session_state:
             st.session_state[k] = v
 
 
-def load_cached_data():
-    path = ".keep_cookies.json"
-    if not os.path.exists(path):
-        return None
-    try:
-        with open(path) as f:
-            return json.load(f)
-    except Exception:
-        return None
-
-
-def save_cached_data(data):
-    existing = load_cached_data()
-    if existing and isinstance(existing, dict):
-        existing.update(data)
-        data = existing
-    with open(".keep_cookies.json", "w") as f:
-        json.dump(data, f)
-
-
-def do_logout():
-    for key in list(st.session_state.keys()):
-        del st.session_state[key]
-    clear_session()
-    for f in [".keep_cookies.json"]:
-        if os.path.exists(f):
-            os.remove(f)
-    init_session_state()
-
-
-# ── 로그인 페이지 ──────────────────────────────────────────
 def login_page():
     st.title("🚗 차량 번호판 체커")
+    config = load_config()
+    if config.get("cookies") and config.get("email"):
+        st.session_state.logged_in = True
+        st.session_state.page = "note_url" if not config.get("note_url") else "camera"
+        st.rerun()
 
-    if is_logged_in():
-        cached = load_cached_data()
-        if cached and isinstance(cached, dict) and cached.get("email"):
-            st.session_state.logged_in = True
-            st.session_state.email = cached["email"]
-            if cached.get("note_url"):
-                st.session_state.note_url = cached["note_url"]
-                st.session_state.page = "camera"
-            else:
-                st.session_state.page = "note_url"
-            st.rerun()
+    st.markdown("### 구글 킵 쿠키 설정")
+    st.markdown("""
+    **방법:**
+    1. PC 브라우저에서 [keep.google.com](https://keep.google.com) 접속 (이미 로그인 상태)
+    2. 개발자 도구 열기 (`F12`)
+    3. **Application** → **Cookies** → `https://keep.google.com`
+    4. 모든 쿠키를 JSON으로 복사하여 아래에 붙여넣기
+    """)
 
-    st.markdown("### 구글 로그인")
-    st.markdown("아래 버튼 클릭 → PC 브라우저에서 구글 로그인 → Keep 접속까지 완료")
+    st.markdown("**간편 방법:** 아래 북마클릿을 브라우저 주소창에 붙여넣고 실행하면 쿠키가 복사됩니다:")
+    st.code(
+        "javascript:void(fetch('https://keep.google.com').then(r=>r.headers).catch(()=>{}));JSON.stringify(document.cookie.split('; ').map(c=>{const[n,...v]=c.split('=');return{name:n,value:v.join('='),domain:'.google.com',path:'/',secure:true}}))",
+        language="javascript",
+    )
 
-    if st.button("🔑 구글 로그인 (브라우저 창 열기)", type="primary"):
-        with st.spinner("브라우저에서 로그인 중... Keep에 접속할 때까지 기다려주세요."):
-            success = login_with_playwright()
-        if success:
-            st.success("로그인 완료!")
-        else:
-            st.error("로그인 실패. 다시 시도해주세요.")
+    cookies_input = st.text_area(
+        "쿠키 JSON",
+        placeholder='[{"name":"SID","value":"...","domain":".google.com",...}]',
+        key="cookies_input",
+        height=150,
+    )
 
-    email = st.text_input("이메일 입력", key="login_email", placeholder="your@gmail.com")
-    if st.button("다음", type="primary"):
+    email = st.text_input("구글 이메일", key="login_email", placeholder="your@gmail.com")
+
+    if st.button("🔑 로그인", type="primary"):
+        if not cookies_input.strip():
+            st.error("쿠키를 입력해주세요.")
+            return
         if not email:
             st.error("이메일을 입력해주세요.")
             return
-        if not is_logged_in():
-            st.error("먼저 구글 로그인을 해주세요.")
+        try:
+            parsed = json.loads(cookies_input)
+            if not isinstance(parsed, list):
+                st.error("JSON 배열이어야 합니다.")
+                return
+        except json.JSONDecodeError:
+            st.error("쿠키 JSON 형식이 올바르지 않습니다.")
             return
-        save_cached_data({"email": email})
+        save_config({"cookies": cookies_input.strip(), "email": email})
         st.session_state.logged_in = True
-        st.session_state.email = email
         st.session_state.page = "note_url"
         st.rerun()
 
 
-# ── 메모 URL 입력 페이지 ────────────────────────────────────
 def note_url_page():
     st.title("📌 구글 킵 메모 설정")
-    st.markdown(f"**로그인:** {st.session_state.email}")
+    config = load_config()
+    st.markdown(f"**로그인:** {config.get('email', '?')}")
 
-    st.markdown("---")
-    st.markdown("### 메모 URL 입력 방법")
-    st.markdown(
-        "1. PC 브라우저에서 **keep.google.com** 접속\n"
-        "2. 체크리스트 메모를 엽니다\n"
-        "3. 주소창의 URL을 복사합니다\n"
-        "4. 아래에 붙여넣기 합니다"
-    )
+    st.markdown("### 메모 URL 입력")
+    st.markdown("PC 브라우저에서 Keep 메모를 열고 주소창 URL을 복사해서 붙여넣기 하세요.")
 
     note_url = st.text_input(
         "구글 킵 메모 URL",
-        placeholder="https://keep.google.com/#LIST/abc123...",
+        placeholder="https://keep.google.com/u/0/#LIST/abc123...",
         key="note_url_input",
     )
 
-    if st.button("📌 메모 설정 완료", type="primary"):
-        if not note_url:
-            st.error("메모 URL을 입력해주세요.")
+    if st.button("📌 설정 완료", type="primary"):
+        if not note_url or "keep.google.com" not in note_url:
+            st.error("구글 킵 URL을 입력해주세요.")
             return
-        if "keep.google.com" not in note_url:
-            st.error("구글 킵 URL이 아닙니다.")
-            return
-        st.session_state.note_url = note_url
-        save_cached_data({"note_url": note_url})
+        save_config({"note_url": note_url})
         st.session_state.page = "camera"
         st.rerun()
 
-    if st.session_state.get("note_url"):
-        st.markdown("---")
-        st.info(f"**현재 설정된 메모:** {st.session_state.note_url}")
+    if config.get("note_url"):
+        st.info(f"**현재 메모:** {config['note_url']}")
 
     with st.sidebar:
         if st.button("로그아웃"):
-            do_logout()
+            clear_config()
+            for key in list(st.session_state.keys()):
+                del st.session_state[key]
+            init_session_state()
             st.rerun()
 
 
-# ── 카메라 페이지 ──────────────────────────────────────────
 def camera_page():
     st.title("📸 차량 번호판 촬영")
-    st.markdown(f"**대상 메모:** {st.session_state.get('note_url', '미설정')}")
+    config = load_config()
+    st.markdown(f"**대상 메모:** {config.get('note_url', '미설정')}")
 
     with st.sidebar:
         if st.button("📌 메모 변경"):
             st.session_state.page = "note_url"
             st.rerun()
         if st.button("로그아웃"):
-            do_logout()
+            clear_config()
+            for key in list(st.session_state.keys()):
+                del st.session_state[key]
+            init_session_state()
             st.rerun()
 
     st.markdown("### 번호판 촬영 또는 사진 업로드")
@@ -265,14 +229,13 @@ def camera_page():
         img_bytes = img_upload.getvalue()
 
     plate_number = None
-
     if img_bytes is not None:
         with st.spinner("번호판 인식 중..."):
             plate_number = extract_plate_number(img_bytes)
         if plate_number:
             st.success(f"✅ 인식된 뒷 4자리: **{plate_number}**")
         else:
-            st.warning("번호판을 인식하지 못했습니다. 수동으로 입력해주세요.")
+            st.warning("번호판을 인식하지 못했습니다.")
 
     manual = st.text_input("수동 입력", placeholder="예: 3682", key="manual_plate")
     input_plate = plate_number or (manual.strip() if manual.strip() else None)
@@ -280,40 +243,23 @@ def camera_page():
     if input_plate:
         st.markdown("---")
         with st.spinner("서버에서 Keep 접속 중... 자동 체크합니다."):
-            success, msg = check_item_in_keep(st.session_state.note_url, input_plate)
-        if success:
-            st.success(f"✅ {msg}")
-            st.balloons()
-        else:
-            st.warning(f"⚠️ {msg}")
-            st.link_button("🔗 구글 킵 메모 열기 (수동 체크)", st.session_state.note_url)
+            try:
+                success, msg = check_with_playwright(
+                    config["note_url"], input_plate, config["cookies"]
+                )
+                if success:
+                    st.success(f"✅ {msg}")
+                    st.balloons()
+                else:
+                    st.warning(f"⚠️ {msg}")
+            except Exception as e:
+                st.error(f"체크 실패: {e}")
+                st.link_button("🔗 구글 킵 메모 열기 (수동 체크)", config["note_url"])
 
 
-# ── OCR ───────────────────────────────────────────────────
-def extract_plate_number(image_bytes):
-    nparr = np.frombuffer(image_bytes, np.uint8)
-    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-    pil_img = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
-
-    reader = get_ocr_reader()
-    results = reader.readtext(np.array(pil_img))
-
-    all_digits = ""
-    for bbox, text, conf in results:
-        cleaned = re.sub(r"[^0-9]", "", text)
-        all_digits += cleaned
-
-    if len(all_digits) >= 4:
-        return all_digits[-4:]
-    return None
-
-
-# ── 메인 ──────────────────────────────────────────────────
 def main():
     st.set_page_config(page_title="차량 번호판 체커", page_icon="🚗")
-    ensure_chromium()
     init_session_state()
-
     if st.session_state.page == "login":
         login_page()
     elif st.session_state.page == "note_url":
