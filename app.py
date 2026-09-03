@@ -25,29 +25,33 @@ def get_ocr_reader():
 # ── Playwright 구글 로그인 ─────────────────────────────────
 def login_with_playwright():
     """브라우저 창을 열어서 사용자가 직접 구글 로그인"""
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=False)
-        context = browser.new_context()
-        page = context.new_page()
-        page.goto("https://accounts.google.com/o/oauth2/auth?"
-                   + urllib.parse.urlencode({
-                       "client_id": st.secrets["google_oauth"]["client_id"],
-                       "redirect_uri": "https://keep.google.com/",
-                       "response_type": "token",
-                       "scope": "openid email profile",
-                       "prompt": "select_account",
-                   }))
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=False)
+            context = browser.new_context()
+            page = context.new_page()
+            page.goto("https://accounts.google.com/o/oauth2/auth?"
+                       + urllib.parse.urlencode({
+                           "client_id": st.secrets["google_oauth"]["client_id"],
+                           "redirect_uri": "https://keep.google.com/",
+                           "response_type": "token",
+                           "scope": "openid email profile",
+                           "prompt": "select_account",
+                       }))
 
-        try:
-            page.wait_for_url("https://keep.google.com/**", timeout=120000)
-            cookies = context.cookies()
-            with open(SESSION_FILE, "w") as f:
-                json.dump(cookies, f)
-            browser.close()
-            return True
-        except Exception:
-            browser.close()
-            return False
+            try:
+                page.wait_for_url("https://keep.google.com/**", timeout=120000)
+                cookies = context.cookies()
+                with open(SESSION_FILE, "w") as f:
+                    json.dump(cookies, f)
+                browser.close()
+                return True
+            except Exception:
+                browser.close()
+                return False
+    except Exception as e:
+        st.error(f"브라우저 실행 실패: {e}")
+        return False
 
 
 def is_logged_in():
@@ -68,42 +72,45 @@ def check_item_in_keep(note_url, plate_digits):
     with open(SESSION_FILE) as f:
         cookies = json.load(f)
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        context = browser.new_context()
-        context.add_cookies(cookies)
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            context = browser.new_context()
+            context.add_cookies(cookies)
 
-        page = context.new_page()
-        page.goto(note_url, wait_until="networkidle", timeout=30000)
-        time.sleep(3)
+            page = context.new_page()
+            page.goto(note_url, wait_until="networkidle", timeout=30000)
+            time.sleep(3)
 
-        result = page.evaluate("""(plateDigits) => {
-            const checkboxes = document.querySelectorAll('[role="checkbox"]');
-            for (const cb of checkboxes) {
-                const container = cb.closest('[data-list-id]')
-                    || cb.closest('[data-note-id]')
-                    || cb.parentElement?.parentElement;
-                if (!container) continue;
-                const text = container.textContent || '';
-                if (text.includes(plateDigits)) {
-                    const checked = cb.getAttribute('aria-checked');
-                    if (checked !== 'true') {
-                        cb.click();
-                        return { found: true, wasChecked: false, text: text.trim().substring(0, 50) };
+            result = page.evaluate("""(plateDigits) => {
+                const checkboxes = document.querySelectorAll('[role="checkbox"]');
+                for (const cb of checkboxes) {
+                    const container = cb.closest('[data-list-id]')
+                        || cb.closest('[data-note-id]')
+                        || cb.parentElement?.parentElement;
+                    if (!container) continue;
+                    const text = container.textContent || '';
+                    if (text.includes(plateDigits)) {
+                        const checked = cb.getAttribute('aria-checked');
+                        if (checked !== 'true') {
+                            cb.click();
+                            return { found: true, wasChecked: false, text: text.trim().substring(0, 50) };
+                        }
+                        return { found: true, wasChecked: true, text: text.trim().substring(0, 50) };
                     }
-                    return { found: true, wasChecked: true, text: text.trim().substring(0, 50) };
                 }
-            }
-            return { found: false };
-        }""", plate_digits)
+                return { found: false };
+            }""", plate_digits)
 
-        browser.close()
+            browser.close()
 
-        if result.get("found"):
-            if result.get("wasChecked"):
-                return True, f"이미 체크되어 있었습니다."
-            return True, f"체크 완료!"
-        return False, f"'{plate_digits}' 항목을 찾을 수 없습니다."
+            if result.get("found"):
+                if result.get("wasChecked"):
+                    return True, "이미 체크되어 있었습니다."
+                return True, "체크 완료!"
+            return False, f"'{plate_digits}' 항목을 찾을 수 없습니다."
+    except Exception as e:
+        return False, f"브라우저 오류: {e}"
 
 
 # ── 세션 관리 ──────────────────────────────────────────────

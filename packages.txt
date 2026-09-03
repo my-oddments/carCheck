@@ -1,2 +1,3 @@
+chromium
 tesseract-ocr
 tesseract-ocr-kor
