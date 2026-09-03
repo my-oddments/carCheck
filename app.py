@@ -16,14 +16,12 @@ SESSION_FILE = ".keep_session.json"
 _ocr_reader = None
 
 
-def ensure_playwright_browsers():
-    try:
-        with sync_playwright() as p:
-            p.chromium.launch(headless=True)
-            return True
-    except Exception:
-        subprocess.run(["playwright", "install", "chromium"], capture_output=True)
-        return True
+def ensure_chromium():
+    subprocess.run(
+        ["playwright", "install", "chromium"],
+        capture_output=True,
+        timeout=120,
+    )
 
 
 def get_ocr_reader():
@@ -33,36 +31,35 @@ def get_ocr_reader():
     return _ocr_reader
 
 
+def save_cookies(context):
+    cookies = context.cookies()
+    with open(SESSION_FILE, "w") as f:
+        json.dump(cookies, f)
+
+
+def load_cookies():
+    if not os.path.exists(SESSION_FILE):
+        return None
+    with open(SESSION_FILE) as f:
+        return json.load(f)
+
+
 # ── Playwright 구글 로그인 ─────────────────────────────────
 def login_with_playwright():
-    """브라우저 창을 열어서 사용자가 직접 구글 로그인"""
-    try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=False)
-            context = browser.new_context()
-            page = context.new_page()
-            page.goto("https://accounts.google.com/o/oauth2/auth?"
-                       + urllib.parse.urlencode({
-                           "client_id": st.secrets["google_oauth"]["client_id"],
-                           "redirect_uri": "https://keep.google.com/",
-                           "response_type": "token",
-                           "scope": "openid email profile",
-                           "prompt": "select_account",
-                       }))
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=False)
+        context = browser.new_context()
+        page = context.new_page()
+        page.goto("https://keep.google.com")
 
-            try:
-                page.wait_for_url("https://keep.google.com/**", timeout=120000)
-                cookies = context.cookies()
-                with open(SESSION_FILE, "w") as f:
-                    json.dump(cookies, f)
-                browser.close()
-                return True
-            except Exception:
-                browser.close()
-                return False
-    except Exception as e:
-        st.error(f"브라우저 실행 실패: {e}")
-        return False
+        try:
+            page.wait_for_url("https://keep.google.com/**", timeout=120000)
+            save_cookies(context)
+            browser.close()
+            return True
+        except Exception:
+            browser.close()
+            return False
 
 
 def is_logged_in():
@@ -76,72 +73,63 @@ def clear_session():
 
 # ── Playwright Keep 자동 체크 ──────────────────────────────
 def check_item_in_keep(note_url, plate_digits):
-    """Playwright로 Keep에 접속하여 항목 자동 체크"""
-    if not os.path.exists(SESSION_FILE):
+    cookies = load_cookies()
+    if not cookies:
         return False, "로그인이 필요합니다."
 
-    with open(SESSION_FILE) as f:
-        cookies = json.load(f)
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context()
+        context.add_cookies(cookies)
 
-    try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            context = browser.new_context()
-            context.add_cookies(cookies)
+        page = context.new_page()
+        page.goto(note_url, wait_until="networkidle", timeout=30000)
+        time.sleep(3)
 
-            page = context.new_page()
-            page.goto(note_url, wait_until="networkidle", timeout=30000)
-            time.sleep(3)
-
-            result = page.evaluate("""(plateDigits) => {
-                const checkboxes = document.querySelectorAll('[role="checkbox"]');
-                for (const cb of checkboxes) {
-                    const container = cb.closest('[data-list-id]')
-                        || cb.closest('[data-note-id]')
-                        || cb.parentElement?.parentElement;
-                    if (!container) continue;
-                    const text = container.textContent || '';
-                    if (text.includes(plateDigits)) {
-                        const checked = cb.getAttribute('aria-checked');
-                        if (checked !== 'true') {
-                            cb.click();
-                            return { found: true, wasChecked: false, text: text.trim().substring(0, 50) };
-                        }
-                        return { found: true, wasChecked: true, text: text.trim().substring(0, 50) };
+        result = page.evaluate("""(plateDigits) => {
+            const checkboxes = document.querySelectorAll('[role="checkbox"]');
+            for (const cb of checkboxes) {
+                const container = cb.closest('[data-list-id]')
+                    || cb.closest('[data-note-id]')
+                    || cb.parentElement?.parentElement;
+                if (!container) continue;
+                const text = container.textContent || '';
+                if (text.includes(plateDigits)) {
+                    const checked = cb.getAttribute('aria-checked');
+                    if (checked !== 'true') {
+                        cb.click();
+                        return { found: true, wasChecked: false };
                     }
+                    return { found: true, wasChecked: true };
                 }
-                return { found: false };
-            }""", plate_digits)
+            }
+            return { found: false };
+        }""", plate_digits)
 
-            browser.close()
+        save_cookies(context)
+        browser.close()
 
-            if result.get("found"):
-                if result.get("wasChecked"):
-                    return True, "이미 체크되어 있었습니다."
-                return True, "체크 완료!"
-            return False, f"'{plate_digits}' 항목을 찾을 수 없습니다."
-    except Exception as e:
-        return False, f"브라우저 오류: {e}"
+        if result.get("found"):
+            if result.get("wasChecked"):
+                return True, "이미 체크되어 있었습니다."
+            return True, "체크 완료!"
+        return False, f"'{plate_digits}' 항목을 찾을 수 없습니다."
 
 
 # ── 세션 관리 ──────────────────────────────────────────────
 def init_session_state():
-    defaults = {
-        "logged_in": False,
-        "email": None,
-        "note_url": None,
-        "page": "login",
-    }
+    defaults = {"logged_in": False, "email": None, "note_url": None, "page": "login"}
     for k, v in defaults.items():
         if k not in st.session_state:
             st.session_state[k] = v
 
 
 def load_cached_data():
-    if not os.path.exists(".keep_cookies.json"):
+    path = ".keep_cookies.json"
+    if not os.path.exists(path):
         return None
     try:
-        with open(".keep_cookies.json") as f:
+        with open(path) as f:
             return json.load(f)
     except Exception:
         return None
@@ -156,16 +144,13 @@ def save_cached_data(data):
         json.dump(data, f)
 
 
-def clear_cached_data():
-    for f in [".keep_cookies.json", SESSION_FILE]:
-        if os.path.exists(f):
-            os.remove(f)
-
-
 def do_logout():
     for key in list(st.session_state.keys()):
         del st.session_state[key]
-    clear_cached_data()
+    clear_session()
+    for f in [".keep_cookies.json"]:
+        if os.path.exists(f):
+            os.remove(f)
     init_session_state()
 
 
@@ -186,23 +171,29 @@ def login_page():
             st.rerun()
 
     st.markdown("### 구글 로그인")
-    st.markdown("아래 버튼을 클릭하면 브라우저 창이 열립니다. 구글 계정으로 로그인하세요.")
+    st.markdown("아래 버튼 클릭 → PC 브라우저에서 구글 로그인 → Keep 접속까지 완료")
 
     if st.button("🔑 구글 로그인 (브라우저 창 열기)", type="primary"):
-        with st.spinner("브라우저에서 로그인 중..."):
+        with st.spinner("브라우저에서 로그인 중... Keep에 접속할 때까지 기다려주세요."):
             success = login_with_playwright()
         if success:
             st.success("로그인 완료!")
-            email = st.text_input("이메일 입력", key="login_email", placeholder="your@gmail.com")
-            if st.button("다음"):
-                if email:
-                    save_cached_data({"email": email})
-                    st.session_state.logged_in = True
-                    st.session_state.email = email
-                    st.session_state.page = "note_url"
-                    st.rerun()
         else:
             st.error("로그인 실패. 다시 시도해주세요.")
+
+    email = st.text_input("이메일 입력", key="login_email", placeholder="your@gmail.com")
+    if st.button("다음", type="primary"):
+        if not email:
+            st.error("이메일을 입력해주세요.")
+            return
+        if not is_logged_in():
+            st.error("먼저 구글 로그인을 해주세요.")
+            return
+        save_cached_data({"email": email})
+        st.session_state.logged_in = True
+        st.session_state.email = email
+        st.session_state.page = "note_url"
+        st.rerun()
 
 
 # ── 메모 URL 입력 페이지 ────────────────────────────────────
@@ -213,7 +204,7 @@ def note_url_page():
     st.markdown("---")
     st.markdown("### 메모 URL 입력 방법")
     st.markdown(
-        "1. 브라우저에서 **keep.google.com** 접속\n"
+        "1. PC 브라우저에서 **keep.google.com** 접속\n"
         "2. 체크리스트 메모를 엽니다\n"
         "3. 주소창의 URL을 복사합니다\n"
         "4. 아래에 붙여넣기 합니다"
@@ -288,7 +279,7 @@ def camera_page():
 
     if input_plate:
         st.markdown("---")
-        with st.spinner("Keep에서 자동 체크 중..."):
+        with st.spinner("서버에서 Keep 접속 중... 자동 체크합니다."):
             success, msg = check_item_in_keep(st.session_state.note_url, input_plate)
         if success:
             st.success(f"✅ {msg}")
@@ -320,7 +311,7 @@ def extract_plate_number(image_bytes):
 # ── 메인 ──────────────────────────────────────────────────
 def main():
     st.set_page_config(page_title="차량 번호판 체커", page_icon="🚗")
-    ensure_playwright_browsers()
+    ensure_chromium()
     init_session_state()
 
     if st.session_state.page == "login":
