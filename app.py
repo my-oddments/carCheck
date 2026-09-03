@@ -255,12 +255,24 @@ def camera_page():
             do_logout()
             st.rerun()
 
-    img_data = st.camera_input("번호판을 촬영하세요")
+    st.markdown("### 번호판 촬영 또는 사진 업로드")
+    col1, col2 = st.columns(2)
+    with col1:
+        img_data = st.camera_input("📷 카메라로 촬영", key="camera")
+    with col2:
+        img_upload = st.file_uploader("🖼️ 사진 업로드", type=["jpg", "jpeg", "png", "heic"], key="upload")
+
+    img_bytes = None
+    if img_data is not None:
+        img_bytes = img_data.getvalue()
+    elif img_upload is not None:
+        img_bytes = img_upload.getvalue()
+
     plate_number = None
 
-    if img_data is not None:
+    if img_bytes is not None:
         with st.spinner("번호판 인식 중..."):
-            result = extract_plate_number(img_data.getvalue())
+            result = extract_plate_number(img_bytes)
             plate_number, raw_text, original_img, processed_img = result
         if plate_number:
             st.success(f"✅ 인식된 번호: **{plate_number}**")
