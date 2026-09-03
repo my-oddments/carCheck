@@ -1,7 +1,7 @@
 streamlit
-playwright
-pytesseract
+easyocr
 pillow
 opencv-python-headless
 google-auth-oauthlib
 google-auth
+requests

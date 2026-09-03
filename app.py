@@ -5,13 +5,20 @@ import os
 import time
 import urllib.parse
 import requests as req
-
 import cv2
 import numpy as np
 from PIL import Image
-import pytesseract
+import easyocr
 
 TOKEN_FILE = ".keep_cookies.json"
+_ocr_reader = None
+
+
+def get_ocr_reader():
+    global _ocr_reader
+    if _ocr_reader is None:
+        _ocr_reader = easyocr.Reader(["ko", "en"], gpu=False, verbose=False)
+    return _ocr_reader
 
 
 def get_redirect_uri():
@@ -272,18 +279,13 @@ def camera_page():
 
     if img_bytes is not None:
         with st.spinner("번호판 인식 중..."):
-            result = extract_plate_number(img_bytes)
-            plate_number, raw_text, original_img, processed_img = result
+            plate_number = extract_plate_number(img_bytes)
         if plate_number:
-            st.success(f"✅ 인식된 번호: **{plate_number}**")
+            st.success(f"✅ 인식된 뒷 4자리: **{plate_number}**")
         else:
             st.warning("번호판을 인식하지 못했습니다. 수동으로 입력해주세요.")
-            with st.expander("🔍 OCR 디버그 정보", expanded=False):
-                st.image(original_img, caption="원본 이미지")
-                st.image(processed_img, caption="전처리 이미지")
-                st.code(f"Tesseract 출력:\n{raw_text}", language="text")
 
-    manual = st.text_input("수동 입력", placeholder="예: 12가3456", key="manual_plate")
+    manual = st.text_input("수동 입력", placeholder="예: 3682", key="manual_plate")
     input_plate = plate_number or (manual.strip() if manual.strip() else None)
 
     if input_plate:
@@ -307,53 +309,23 @@ def camera_page():
 
 
 # ── OCR ───────────────────────────────────────────────────
-def preprocess_image(image_bytes):
+def extract_plate_number(image_bytes):
     nparr = np.frombuffer(image_bytes, np.uint8)
     img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    h, w = gray.shape
-    if w < 800:
-        scale = 800 / w
-        gray = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
-    gray = cv2.GaussianBlur(gray, (3, 3), 0)
-    gray = cv2.addWeighted(gray, 1.5, gray, -0.5, 0)
-    _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    return img, thresh
+    pil_img = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
 
+    reader = get_ocr_reader()
+    results = reader.readtext(np.array(pil_img))
 
-def extract_plate_number(image_bytes):
-    original, processed = preprocess_image(image_bytes)
-    pil_img = Image.fromarray(processed)
-    pil_original = Image.fromarray(cv2.cvtColor(original, cv2.COLOR_BGR2RGB))
+    all_digits = ""
+    for bbox, text, conf in results:
+        cleaned = re.sub(r"[^0-9]", "", text)
+        all_digits += cleaned
 
-    configs = [
-        "--psm 6 -l kor+eng",
-        "--psm 7 -l kor+eng",
-        "--psm 8 -l kor+eng",
-        "--psm 13 -l kor+eng",
-    ]
-    all_text = []
-    for cfg in configs:
-        text = pytesseract.image_to_string(pil_img, config=cfg)
-        all_text.append(text.strip())
+    if len(all_digits) >= 4:
+        return all_digits[-4:]
 
-    combined = " ".join(all_text).replace(" ", "")
-
-    patterns = [
-        r"\d{4}[가-힣]\d{4}",
-        r"\d{3}[가-힣]\d{4}",
-        r"\d{2,3}[가-힣]\d{4}",
-    ]
-    for pat in patterns:
-        match = re.search(pat, combined)
-        if match:
-            return match.group(), combined, pil_original, pil_img
-
-    fallback = re.findall(r"\d+[가-힣]\d+", combined)
-    if fallback:
-        return fallback[0], combined, pil_original, pil_img
-
-    return None, combined, pil_original, pil_img
+    return None
 
 
 # ── 메인 ──────────────────────────────────────────────────
