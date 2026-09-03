@@ -1,0 +1,7 @@
+streamlit
+playwright
+pytesseract
+pillow
+opencv-python-headless
+google-auth-oauthlib
+google-auth

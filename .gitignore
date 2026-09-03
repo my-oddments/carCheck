@@ -1,0 +1,14 @@
+streamlit/
+__pycache__/
+*.pyc
+.gkeep_master_token.json
+.keep_cookies.json
+.venv/
+.env
+*.pem
+*.key
+.omo/
+.codegraph/
+.idea/
+.streamlit/secrets.toml
+get_token.py
