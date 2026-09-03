@@ -64,8 +64,6 @@ def init_session_state():
         "logged_in": False,
         "email": None,
         "note_url": None,
-        "note_title": None,
-        "note_items": [],
         "page": "login",
     }
     for k, v in defaults.items():
@@ -84,6 +82,10 @@ def load_cached_data():
 
 
 def save_cached_data(data):
+    existing = load_cached_data()
+    if existing and isinstance(existing, dict):
+        existing.update(data)
+        data = existing
     with open(TOKEN_FILE, "w") as f:
         json.dump(data, f)
 
@@ -133,7 +135,11 @@ def login_page():
     if cached and isinstance(cached, dict) and cached.get("email"):
         st.session_state.logged_in = True
         st.session_state.email = cached["email"]
-        st.session_state.page = "note_url"
+        if cached.get("note_url"):
+            st.session_state.note_url = cached["note_url"]
+            st.session_state.page = "camera"
+        else:
+            st.session_state.page = "note_url"
         st.rerun()
 
     st.markdown("---")
@@ -220,6 +226,7 @@ def note_url_page():
 
         st.session_state.note_url = note_url
         st.session_state.note_id = note_id
+        save_cached_data({"note_url": note_url})
         st.session_state.page = "camera"
         st.rerun()
 
