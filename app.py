@@ -3,38 +3,53 @@ import re
 import json
 import os
 import time
+import urllib.parse
 import requests as req
 
 import cv2
 import numpy as np
 from PIL import Image
 import pytesseract
-from playwright.sync_api import sync_playwright
 
 TOKEN_FILE = ".keep_cookies.json"
-GOOGLE_AUTH_URL = (
-    "https://accounts.google.com/o/oauth2/auth?"
-    "client_id={client_id}"
-    "&redirect_uri=http%3A%2F%2Flocalhost%3A8501%2F"
-    "&response_type=code"
-    "&scope=openid+email+profile"
-    "&prompt=select_account"
-    "&access_type=offline"
-    "&include_granted_scopes=true"
-)
+
+
+def get_redirect_uri():
+    """환경에 따라 redirect_uri 자동 결정 (로컬: localhost, 배포: secrets 값)"""
+    uri = st.secrets.get("google_oauth", {}).get("redirect_uri", "")
+    if not uri or "localhost" in uri:
+        return "http://localhost:8501/"
+    return uri
+
+
+def build_auth_url():
+    """OAuth 인증 URL 생성"""
+    client_id = st.secrets.get("google_oauth", {}).get("client_id", "")
+    redirect_uri = get_redirect_uri()
+    params = urllib.parse.urlencode({
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
+        "response_type": "code",
+        "scope": "openid email profile",
+        "prompt": "select_account",
+        "access_type": "offline",
+        "include_granted_scopes": "true",
+    })
+    return f"https://accounts.google.com/o/oauth2/auth?{params}"
 
 
 def exchange_code_for_token(code):
     """Authorization code를 access_token으로 교환"""
     client_id = st.secrets["google_oauth"]["client_id"]
     client_secret = st.secrets["google_oauth"]["client_secret"]
+    redirect_uri = get_redirect_uri()
     resp = req.post(
         "https://oauth2.googleapis.com/token",
         data={
             "code": code,
             "client_id": client_id,
             "client_secret": client_secret,
-            "redirect_uri": "http://localhost:8501/",
+            "redirect_uri": redirect_uri,
             "grant_type": "authorization_code",
         },
     )
