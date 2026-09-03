@@ -2,6 +2,7 @@ import streamlit as st
 import re
 import json
 import os
+import subprocess
 import time
 import urllib.parse
 import requests as req
@@ -13,6 +14,16 @@ from playwright.sync_api import sync_playwright
 
 SESSION_FILE = ".keep_session.json"
 _ocr_reader = None
+
+
+def ensure_playwright_browsers():
+    try:
+        with sync_playwright() as p:
+            p.chromium.launch(headless=True)
+            return True
+    except Exception:
+        subprocess.run(["playwright", "install", "chromium"], capture_output=True)
+        return True
 
 
 def get_ocr_reader():
@@ -309,6 +320,7 @@ def extract_plate_number(image_bytes):
 # ── 메인 ──────────────────────────────────────────────────
 def main():
     st.set_page_config(page_title="차량 번호판 체커", page_icon="🚗")
+    ensure_playwright_browsers()
     init_session_state()
 
     if st.session_state.page == "login":
