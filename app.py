@@ -287,6 +287,15 @@ def preprocess_image(image_bytes):
     nparr = np.frombuffer(image_bytes, np.uint8)
     img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    # 크기 확대 (작은 번호판 인식률 향상)
+    h, w = gray.shape
+    if w < 800:
+        scale = 800 / w
+        gray = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+    # 선명하게
+    gray = cv2.GaussianBlur(gray, (3, 3), 0)
+    gray = cv2.addWeighted(gray, 1.5, gray, -0.5, 0)
+    # 이진화
     _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     return thresh
 
@@ -294,12 +303,33 @@ def preprocess_image(image_bytes):
 def extract_plate_number(image_bytes):
     processed = preprocess_image(image_bytes)
     pil_img = Image.fromarray(processed)
-    config = "--psm 7 -l kor+eng"
-    text = pytesseract.image_to_string(pil_img, config=config)
-    text = text.strip().replace(" ", "")
-    pattern = r"\d{2,3}[가-힣]\d{4}"
-    match = re.search(pattern, text)
-    return match.group() if match else None
+    # psm 6: 균일한 텍스트 블록 가정 (번호판에 적합)
+    configs = [
+        "--psm 6 -l kor+eng",
+        "--psm 7 -l kor+eng",
+        "--psm 8 -l kor+eng",
+    ]
+    all_text = []
+    for cfg in configs:
+        text = pytesseract.image_to_string(pil_img, config=cfg)
+        all_text.append(text.strip())
+    # 전체 텍스트 합치기
+    combined = " ".join(all_text).replace(" ", "")
+    # 한국 번호판 패턴 (다양한 형식 지원)
+    patterns = [
+        r"\d{4}[가-힣]\d{4}",  # 1234가5678
+        r"\d{3}[가-힣]\d{4}",  # 123가4567
+        r"\d{2,3}[가-힣]\d{4}",  # 12가3456, 123가4567
+    ]
+    for pat in patterns:
+        match = re.search(pat, combined)
+        if match:
+            return match.group()
+    # 패턴 불일치 시 숫자+한글 조합 시도
+    fallback = re.findall(r"\d+[가-힣]\d+", combined)
+    if fallback:
+        return fallback[0]
+    return None
 
 
 # ── 메인 ──────────────────────────────────────────────────
