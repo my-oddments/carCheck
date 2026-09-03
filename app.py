@@ -9,8 +9,9 @@ import cv2
 import numpy as np
 from PIL import Image
 import easyocr
+from playwright.sync_api import sync_playwright
 
-TOKEN_FILE = ".keep_cookies.json"
+SESSION_FILE = ".keep_session.json"
 _ocr_reader = None
 
 
@@ -21,48 +22,88 @@ def get_ocr_reader():
     return _ocr_reader
 
 
-def get_redirect_uri():
-    """환경에 따라 redirect_uri 자동 결정 (로컬: localhost, 배포: secrets 값)"""
-    uri = st.secrets.get("google_oauth", {}).get("redirect_uri", "")
-    if not uri or "localhost" in uri:
-        return "http://localhost:8501/"
-    return uri
+# ── Playwright 구글 로그인 ─────────────────────────────────
+def login_with_playwright():
+    """브라우저 창을 열어서 사용자가 직접 구글 로그인"""
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=False)
+        context = browser.new_context()
+        page = context.new_page()
+        page.goto("https://accounts.google.com/o/oauth2/auth?"
+                   + urllib.parse.urlencode({
+                       "client_id": st.secrets["google_oauth"]["client_id"],
+                       "redirect_uri": "https://keep.google.com/",
+                       "response_type": "token",
+                       "scope": "openid email profile",
+                       "prompt": "select_account",
+                   }))
+
+        try:
+            page.wait_for_url("https://keep.google.com/**", timeout=120000)
+            cookies = context.cookies()
+            with open(SESSION_FILE, "w") as f:
+                json.dump(cookies, f)
+            browser.close()
+            return True
+        except Exception:
+            browser.close()
+            return False
 
 
-def build_auth_url():
-    """OAuth 인증 URL 생성"""
-    client_id = st.secrets.get("google_oauth", {}).get("client_id", "")
-    redirect_uri = get_redirect_uri()
-    params = urllib.parse.urlencode({
-        "client_id": client_id,
-        "redirect_uri": redirect_uri,
-        "response_type": "code",
-        "scope": "openid email profile",
-        "prompt": "select_account",
-        "access_type": "offline",
-        "include_granted_scopes": "true",
-    })
-    return f"https://accounts.google.com/o/oauth2/auth?{params}"
+def is_logged_in():
+    return os.path.exists(SESSION_FILE)
 
 
-def exchange_code_for_token(code):
-    """Authorization code를 access_token으로 교환"""
-    client_id = st.secrets["google_oauth"]["client_id"]
-    client_secret = st.secrets["google_oauth"]["client_secret"]
-    redirect_uri = get_redirect_uri()
-    resp = req.post(
-        "https://oauth2.googleapis.com/token",
-        data={
-            "code": code,
-            "client_id": client_id,
-            "client_secret": client_secret,
-            "redirect_uri": redirect_uri,
-            "grant_type": "authorization_code",
-        },
-    )
-    if resp.status_code == 200:
-        return resp.json().get("access_token")
-    return None
+def clear_session():
+    if os.path.exists(SESSION_FILE):
+        os.remove(SESSION_FILE)
+
+
+# ── Playwright Keep 자동 체크 ──────────────────────────────
+def check_item_in_keep(note_url, plate_digits):
+    """Playwright로 Keep에 접속하여 항목 자동 체크"""
+    if not os.path.exists(SESSION_FILE):
+        return False, "로그인이 필요합니다."
+
+    with open(SESSION_FILE) as f:
+        cookies = json.load(f)
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context()
+        context.add_cookies(cookies)
+
+        page = context.new_page()
+        page.goto(note_url, wait_until="networkidle", timeout=30000)
+        time.sleep(3)
+
+        result = page.evaluate("""(plateDigits) => {
+            const checkboxes = document.querySelectorAll('[role="checkbox"]');
+            for (const cb of checkboxes) {
+                const container = cb.closest('[data-list-id]')
+                    || cb.closest('[data-note-id]')
+                    || cb.parentElement?.parentElement;
+                if (!container) continue;
+                const text = container.textContent || '';
+                if (text.includes(plateDigits)) {
+                    const checked = cb.getAttribute('aria-checked');
+                    if (checked !== 'true') {
+                        cb.click();
+                        return { found: true, wasChecked: false, text: text.trim().substring(0, 50) };
+                    }
+                    return { found: true, wasChecked: true, text: text.trim().substring(0, 50) };
+                }
+            }
+            return { found: false };
+        }""", plate_digits)
+
+        browser.close()
+
+        if result.get("found"):
+            if result.get("wasChecked"):
+                return True, f"이미 체크되어 있었습니다."
+            return True, f"체크 완료!"
+        return False, f"'{plate_digits}' 항목을 찾을 수 없습니다."
 
 
 # ── 세션 관리 ──────────────────────────────────────────────
@@ -79,10 +120,10 @@ def init_session_state():
 
 
 def load_cached_data():
-    if not os.path.exists(TOKEN_FILE):
+    if not os.path.exists(".keep_cookies.json"):
         return None
     try:
-        with open(TOKEN_FILE) as f:
+        with open(".keep_cookies.json") as f:
             return json.load(f)
     except Exception:
         return None
@@ -93,13 +134,14 @@ def save_cached_data(data):
     if existing and isinstance(existing, dict):
         existing.update(data)
         data = existing
-    with open(TOKEN_FILE, "w") as f:
+    with open(".keep_cookies.json", "w") as f:
         json.dump(data, f)
 
 
 def clear_cached_data():
-    if os.path.exists(TOKEN_FILE):
-        os.remove(TOKEN_FILE)
+    for f in [".keep_cookies.json", SESSION_FILE]:
+        if os.path.exists(f):
+            os.remove(f)
 
 
 def do_logout():
@@ -109,93 +151,40 @@ def do_logout():
     init_session_state()
 
 
-# ── Keep 메모 읽기 ────────────────────────────────────────
-def read_keep_note(note_url):
-    """Playwright로 Keep 메모 내용 읽기 (로그인 없이 공개 메모만 가능)"""
-    # 공개된 메모가 아니라면 로그인이 필요하므로 URL에서 정보만 추출
-    # Keep URL 형식: https://keep.google.com/#LIST/... 또는 #NOTE/...
-    note_id = None
-    if "#LIST/" in note_url:
-        note_id = note_url.split("#LIST/")[-1].split("?")[0]
-    elif "#NOTE/" in note_url:
-        note_id = note_url.split("#NOTE/")[-1].split("?")[0]
-
-    return note_id
-
-
-def extract_note_id(url):
-    """URL에서 메모 ID 추출"""
-    if "#LIST/" in url:
-        return url.split("#LIST/")[-1].split("?")[0]
-    elif "#NOTE/" in url:
-        return url.split("#NOTE/")[-1].split("?")[0]
-    return None
-
-
 # ── 로그인 페이지 ──────────────────────────────────────────
 def login_page():
     st.title("🚗 차량 번호판 체커")
-    st.markdown("### 구글 킵 로그인")
 
-    # 기존 세션 확인
-    cached = load_cached_data()
-    if cached and isinstance(cached, dict) and cached.get("email"):
-        st.session_state.logged_in = True
-        st.session_state.email = cached["email"]
-        if cached.get("note_url"):
-            st.session_state.note_url = cached["note_url"]
-            st.session_state.page = "camera"
+    if is_logged_in():
+        cached = load_cached_data()
+        if cached and isinstance(cached, dict) and cached.get("email"):
+            st.session_state.logged_in = True
+            st.session_state.email = cached["email"]
+            if cached.get("note_url"):
+                st.session_state.note_url = cached["note_url"]
+                st.session_state.page = "camera"
+            else:
+                st.session_state.page = "note_url"
+            st.rerun()
+
+    st.markdown("### 구글 로그인")
+    st.markdown("아래 버튼을 클릭하면 브라우저 창이 열립니다. 구글 계정으로 로그인하세요.")
+
+    if st.button("🔑 구글 로그인 (브라우저 창 열기)", type="primary"):
+        with st.spinner("브라우저에서 로그인 중..."):
+            success = login_with_playwright()
+        if success:
+            st.success("로그인 완료!")
+            email = st.text_input("이메일 입력", key="login_email", placeholder="your@gmail.com")
+            if st.button("다음"):
+                if email:
+                    save_cached_data({"email": email})
+                    st.session_state.logged_in = True
+                    st.session_state.email = email
+                    st.session_state.page = "note_url"
+                    st.rerun()
         else:
-            st.session_state.page = "note_url"
-        st.rerun()
-
-    st.markdown("---")
-    st.markdown("### 로그인 방법")
-    st.markdown(
-        "1. 아래 **[1단계] 구글 로그인** 클릭 → 구글 계정으로 로그인\n"
-        "2. 로그인 후 자동으로 돌아와서 토큰이 입력됩니다\n"
-        "3. 이메일 입력 후 **[2단계] 로그인** 클릭"
-    )
-
-    client_id = st.secrets.get("google_oauth", {}).get("client_id", "")
-    if client_id:
-        auth_url = build_auth_url()
-        st.link_button("🔑 [1단계] 구글 로그인", auth_url)
-    else:
-        st.error("client_id가 설정되지 않았습니다.")
-
-    st.markdown("---")
-
-    # URL에서 authorization code 자동 추출
-    qp = st.query_params
-    code = qp.get("code", "")
-    auto_token = ""
-    if code:
-        with st.spinner("토큰 교환 중..."):
-            auto_token = exchange_code_for_token(code) or ""
-        if auto_token:
-            st.success("로그인 토큰 자동 추출 완료!")
-            st.query_params.clear()
-        else:
-            st.error("토큰 교환 실패. 다시 시도해주세요.")
-
-    oauth_token = st.text_input(
-        "access_token 값",
-        value=auto_token,
-        placeholder="ya29.a0AfH6SMB...",
-        key="oauth_token_input",
-    )
-    email = st.text_input("구글 이메일", key="login_email", placeholder="your@gmail.com")
-
-    if st.button("🔑 [2단계] 로그인", type="primary"):
-        if not email:
-            st.error("이메일을 입력해주세요.")
-            return
-        st.session_state.logged_in = True
-        st.session_state.email = email
-        save_cached_data({"email": email})
-        st.session_state.page = "note_url"
-        st.rerun()
+            st.error("로그인 실패. 다시 시도해주세요.")
 
 
 # ── 메모 URL 입력 페이지 ────────────────────────────────────
@@ -225,19 +214,11 @@ def note_url_page():
         if "keep.google.com" not in note_url:
             st.error("구글 킵 URL이 아닙니다.")
             return
-
-        note_id = extract_note_id(note_url)
-        if not note_id:
-            st.error("URL에서 메모 ID를 추출할 수 없습니다.")
-            return
-
         st.session_state.note_url = note_url
-        st.session_state.note_id = note_id
         save_cached_data({"note_url": note_url})
         st.session_state.page = "camera"
         st.rerun()
 
-    # 기존 설정이 있으면 보여주기
     if st.session_state.get("note_url"):
         st.markdown("---")
         st.info(f"**현재 설정된 메모:** {st.session_state.note_url}")
@@ -254,7 +235,6 @@ def camera_page():
     st.markdown(f"**대상 메모:** {st.session_state.get('note_url', '미설정')}")
 
     with st.sidebar:
-        st.markdown("### 설정")
         if st.button("📌 메모 변경"):
             st.session_state.page = "note_url"
             st.rerun()
@@ -290,22 +270,14 @@ def camera_page():
 
     if input_plate:
         st.markdown("---")
-        st.markdown(f"### 🔍 '{input_plate}' 항목을 찾으세요")
-        st.markdown(
-            f"아래 버튼을 클릭하면 구글 킵 메모가 열립니다.\n"
-            f"메모에서 **'{input_plate}'** 이(가) 포함된 항목을 찾아 체크하세요."
-        )
-
-        note_url = st.session_state.get("note_url", "")
-        if note_url:
-            st.link_button("🔗 구글 킵 메모 열기", note_url)
-
-        st.markdown("---")
-        st.markdown("**체크 완료 후:** ✅ 버튼을 클릭하세요.")
-
-        if st.button("✅ 체크 완료", type="primary"):
-            st.success(f"'{input_plate}' 체크 완료를 확인했습니다!")
+        with st.spinner("Keep에서 자동 체크 중..."):
+            success, msg = check_item_in_keep(st.session_state.note_url, input_plate)
+        if success:
+            st.success(f"✅ {msg}")
             st.balloons()
+        else:
+            st.warning(f"⚠️ {msg}")
+            st.link_button("🔗 구글 킵 메모 열기 (수동 체크)", st.session_state.note_url)
 
 
 # ── OCR ───────────────────────────────────────────────────
@@ -324,7 +296,6 @@ def extract_plate_number(image_bytes):
 
     if len(all_digits) >= 4:
         return all_digits[-4:]
-
     return None
 
 
