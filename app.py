@@ -146,7 +146,7 @@ def login_page():
 
     client_id = st.secrets.get("google_oauth", {}).get("client_id", "")
     if client_id:
-        auth_url = GOOGLE_AUTH_URL.format(client_id=client_id)
+        auth_url = build_auth_url()
         st.link_button("🔑 [1단계] 구글 로그인", auth_url)
     else:
         st.error("client_id가 설정되지 않았습니다.")
